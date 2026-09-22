@@ -25,7 +25,7 @@
 - Python 3.13 与 uv
 - Node.js 22+
 - 统一版 Weixin.exe
-- WMPF runtime 25710
+- WMPF runtime 25710 / 25715
 - 可正常打开的引导小程序 App ID
 
 ```powershell
@@ -81,7 +81,7 @@ uv run python run.py --help
 
 ## 版本约束
 
-当前 Frida 地址配置和启动补丁针对 WMPF runtime `25710`。客户端升级后，需要重新确认偏移和启动参数。
+当前已适配 WMPF runtime `25710` 和 `25715`。Search detach 与 XWeb 控制偏移会按照 runtime 版本及 `flue.dll` SHA256 精确加载，配置位于 [`tools/offsets`](tools/offsets)；其他版本或文件哈希不匹配时会停止启动，避免误用偏移。
 
 ## 后续版本方向
 
@@ -96,7 +96,7 @@ uv run python run.py --help
 3. 自动建立 `9421 → 62000` 通道，检测断线并重新连接。
 4. 通过原生 `AddTab` 创建 Search，按 URL 精确绑定 Search/Profile WebContents。
 5. 将搜索公众号、选择精确账号、打开主页、分页和文章提取统一封装为 Python API。
-6. 为不同 WMPF runtime 版本维护地址配置和启动补丁，并在启动前执行版本检查。
+6. 为不同 WMPF runtime 版本维护独立地址配置，按版本及 `flue.dll` SHA256 校验后加载。
 
 该方向的优势是已有完整采集链路，适合优先提高自动化程度、容错能力和版本兼容性。
 
