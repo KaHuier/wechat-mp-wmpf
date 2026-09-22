@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -137,6 +138,58 @@ class PublicApiTests(unittest.TestCase):
         runtime = self.runtime()
         self.assertFalse(hasattr(runtime, "collect_account"))
         self.assertFalse(hasattr(runtime, "collect_account_articles"))
+
+    def test_launch_patch_process_is_removed(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        self.assertFalse((project / "tools" / "patch_launch_config.js").exists())
+        runtime_source = (project / "_wechat_mp" / "runtime.py").read_text("utf-8")
+        self.assertNotIn("patch_launch_config", runtime_source)
+        self.assertNotIn("LAUNCH_PATCH_READY", runtime_source)
+
+    def test_search_detach_offsets_are_keyed_by_version_and_hash(self) -> None:
+        project = Path(__file__).resolve().parents[1]
+        sha256 = "3211EE33FD42F96EDF8390E641AF671A47B77D03CC09C4723DAFDBAE5CF75665"
+        config_path = (
+            project / "tools" / "offsets" / "search_detach" / "25710"
+            / f"{sha256}.json"
+        )
+        config = json.loads(config_path.read_text("utf-8"))
+        self.assertEqual(config["version"], 25710)
+        self.assertEqual(config["flueSha256"], sha256)
+        self.assertEqual(
+            set(config["offsets"]),
+            {"valueInit", "dictSet", "invokeNative", "valueDestroy",
+             "manager", "dispatchPoint", "bizKey"},
+        )
+
+        inventory = json.loads(
+            (project / "tools" / "offsets" / "wmpf-runtimes.json").read_text("utf-8")
+        )
+        by_version = {item["version"]: item for item in inventory["runtimes"]}
+        self.assertEqual(by_version[25710]["flueSha256"], sha256)
+        self.assertEqual(
+            by_version[25715]["flueSha256"],
+            "5BAF4A84A41036CE5B2EF897D85029BDE9EE9965B4A69D4F5B594672821CAD56",
+        )
+        config_25715 = by_version[25715]["searchDetachConfig"]
+        self.assertIsNotNone(config_25715)
+        detach_25715 = json.loads(
+            (project / "tools" / "offsets" / config_25715).read_text("utf-8")
+        )
+        self.assertEqual(detach_25715["version"], 25715)
+        self.assertEqual(
+            detach_25715["flueSha256"],
+            by_version[25715]["flueSha256"],
+        )
+        self.assertEqual(detach_25715["offsets"]["invokeNative"], "0x280EAE0")
+        xweb_25715 = json.loads(
+            (
+                project / "tools" / "offsets"
+                / by_version[25715]["xwebControlConfig"]
+            ).read_text("utf-8")
+        )
+        self.assertEqual(xweb_25715["version"], 25715)
+        self.assertEqual(xweb_25715["offsets"]["dispatchPoint"], "0x3E67250")
 
     def test_invalid_page_limit(self) -> None:
         account = OfficialAccount(

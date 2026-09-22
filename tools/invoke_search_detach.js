@@ -1,8 +1,9 @@
 "use strict";
 
 // Invoke Search's native "show as independent window" action on the WMPF UI
-// thread. Offsets below are valid only for WMPF runtime 25710.
+// thread. Native offsets are selected by WMPF version plus flue.dll SHA256.
 const path = require("node:path");
+const {loadSearchDetachConfig} = require("./search_detach_config");
 const debuggerDir = process.env.WMPF_DEBUGGER_DIR;
 if (!debuggerDir) throw new Error("WMPF_DEBUGGER_DIR is required");
 const frida = require(path.join(debuggerDir, "node_modules", "frida"));
@@ -15,21 +16,41 @@ if (!Number.isInteger(pid) || !Number.isInteger(threadId)) {
 
 (async () => {
   const session = await (await frida.getLocalDevice()).attach(pid);
+  const runtimeProbe = await session.createScript(`
+    const flue = Process.getModuleByName("flue.dll");
+    send({event:"runtime", path:flue.path});
+  `);
+  const fluePath = await new Promise((resolve, reject) => {
+    runtimeProbe.message.connect(message => {
+      if (message.type === "send" && message.payload?.event === "runtime") {
+        resolve(message.payload.path);
+      } else if (message.type === "error") {
+        reject(new Error(message.description || "failed to inspect flue.dll"));
+      }
+    });
+    runtimeProbe.load().catch(reject);
+  });
+  await runtimeProbe.unload();
+  const runtime = loadSearchDetachConfig(fluePath);
+  const offsets = runtime.config.offsets;
+  process.stdout.write(JSON.stringify({
+    event: "config",
+    version: runtime.version,
+    flueSha256: runtime.sha256,
+    configPath: runtime.configPath,
+  }) + "\n");
   let finished = false;
   let timer;
   const source = `
     "use strict";
     const expectedThreadId = ${threadId};
     const flue = Process.getModuleByName("flue.dll");
-    if (!/[\\\\/]25710[\\\\/]/.test(flue.path)) {
-      throw new Error("unsupported WMPF runtime: " + flue.path);
-    }
-    const valueInit = new NativeFunction(flue.base.add(0x3a0860), "pointer", ["pointer", "uchar"]);
-    const dictSet = new NativeFunction(flue.base.add(0x40813a0), "pointer", ["pointer", "pointer", "pointer"]);
-    const invokeNative = new NativeFunction(flue.base.add(0x280f190), "void", ["pointer", "pointer", "pointer"]);
-    const valueDestroy = new NativeFunction(flue.base.add(0x50e4530), "void", ["pointer"]);
-    const manager = flue.base.add(0xdc1cca0);
-    const dispatchPoint = flue.base.add(0x3e679e0);
+    const valueInit = new NativeFunction(flue.base.add(${JSON.stringify(offsets.valueInit)}), "pointer", ["pointer", "uchar"]);
+    const dictSet = new NativeFunction(flue.base.add(${JSON.stringify(offsets.dictSet)}), "pointer", ["pointer", "pointer", "pointer"]);
+    const invokeNative = new NativeFunction(flue.base.add(${JSON.stringify(offsets.invokeNative)}), "void", ["pointer", "pointer", "pointer"]);
+    const valueDestroy = new NativeFunction(flue.base.add(${JSON.stringify(offsets.valueDestroy)}), "void", ["pointer"]);
+    const manager = flue.base.add(${JSON.stringify(offsets.manager)});
+    const dispatchPoint = flue.base.add(${JSON.stringify(offsets.dispatchPoint)});
     const methodText = "xweb_call_discovery_detach_button_clicked";
     let pending = true;
 
@@ -47,7 +68,7 @@ if (!Number.isInteger(pid) || !Number.isInteger(threadId)) {
           intValue.writeS32(2);
           intValue.add(0x18).writeU8(2);
           const key = Memory.alloc(0x10);
-          key.writePointer(flue.base.add(0xbfb052f));
+          key.writePointer(flue.base.add(${JSON.stringify(offsets.bizKey)}));
           key.add(8).writeU64(3);
           dictSet(dict, key, intValue);
           const methodBuffer = Memory.allocUtf8String(methodText);

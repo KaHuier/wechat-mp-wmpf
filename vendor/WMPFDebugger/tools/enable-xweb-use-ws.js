@@ -1,6 +1,10 @@
 "use strict";
 
+const path = require("node:path");
 const frida = require("frida");
+const projectDir = process.env.WMPF_PROJECT_DIR;
+if (!projectDir) throw new Error("WMPF_PROJECT_DIR is required");
+const {loadXwebControlConfig} = require(path.join(projectDir, "tools", "xweb_control_config"));
 const pid = Number(process.argv[2]);
 const threadId = Number(process.argv[3]);
 const timeoutMs = Number(process.argv[4] || 15000);
@@ -10,16 +14,35 @@ if (!Number.isInteger(pid) || !Number.isInteger(threadId)) {
 
 (async () => {
     const session = await (await frida.getLocalDevice()).attach(pid);
+    const runtimeProbe = await session.createScript(`
+        const flue = Process.getModuleByName("flue.dll");
+        send({event:"runtime", path:flue.path});
+    `);
+    const fluePath = await new Promise((resolve, reject) => {
+        runtimeProbe.message.connect((message) => {
+            if (message.type === "send" && message.payload?.event === "runtime") {
+                resolve(message.payload.path);
+            } else if (message.type === "error") {
+                reject(new Error(message.description || "failed to inspect flue.dll"));
+            }
+        });
+        runtimeProbe.load().catch(reject);
+    });
+    await runtimeProbe.unload();
+    const runtime = loadXwebControlConfig(fluePath);
+    const offsets = runtime.config.offsets;
+    process.stdout.write(JSON.stringify({event:"config", version:runtime.version,
+        flueSha256:runtime.sha256, configPath:runtime.configPath}) + "\n");
     let finished = false;
     let timer;
     const source = `
         "use strict";
         const expectedThreadId = ${threadId};
         const module = Process.getModuleByName("flue.dll");
-        const getManager = new NativeFunction(module.base.add(0x26b2ec0), "pointer", []);
-        const getDebugSetting = new NativeFunction(module.base.add(0x26b3e90), "uchar", ["pointer", "pointer"]);
-        const setDebugSetting = new NativeFunction(module.base.add(0x26b40b0), "void", ["pointer", "pointer", "uchar", "pointer"]);
-        const dispatchPoint = module.base.add(0x3e679e0);
+        const getManager = new NativeFunction(module.base.add(${JSON.stringify(offsets.getManager)}), "pointer", []);
+        const getDebugSetting = new NativeFunction(module.base.add(${JSON.stringify(offsets.getDebugSetting)}), "uchar", ["pointer", "pointer"]);
+        const setDebugSetting = new NativeFunction(module.base.add(${JSON.stringify(offsets.setDebugSetting)}), "void", ["pointer", "pointer", "uchar", "pointer"]);
+        const dispatchPoint = module.base.add(${JSON.stringify(offsets.dispatchPoint)});
         const keyText = "xweb_use_enable_ws_server";
         const keyBuffer = Memory.allocUtf8String(keyText);
         const key = Memory.alloc(0x20);

@@ -1,8 +1,8 @@
 {
-    "Version": 25710,
-    "LoadStartHookOffset": "0x2D45E40",
-    "CDPFilterHookOffset": "0x38193E0",
-    "CastToJsonHookOffset": "0xA79CF0",
+    "Version": 25715,
+    "LoadStartHookOffset": "0x2D456B0",
+    "CDPFilterHookOffset": "0x381C1D0",
+    "CastToJsonHookOffset": "0x9EC7870",
     "MiniAppConfigStructOffsets": {
         "LaunchConfigOffsets": [64, 1568, 8],
         "RemoteDebugConfigOffsets": [1504, 16],

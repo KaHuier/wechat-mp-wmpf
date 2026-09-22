@@ -33,7 +33,6 @@ from .models import (
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DEBUGGER_DIR = PROJECT_DIR / "vendor" / "WMPFDebugger"
-PATCH_SCRIPT = PROJECT_DIR / "tools" / "patch_launch_config.js"
 DETACH_SCRIPT = PROJECT_DIR / "tools" / "invoke_search_detach.js"
 OPEN_SEARCH_SCRIPT = PROJECT_DIR / "tools" / "open_search_tab.js"
 ENABLE_XWEB_SCRIPT = DEBUGGER_DIR / "tools" / "enable-xweb-use-ws.js"
@@ -352,10 +351,8 @@ class WeChatRuntime:
             self._ensure_search_target()
             return
         _stop_stale_debugger(self.cdp_url, DEBUGGER_DIR, self._status)
-        _stop_stale_launch_patches(self._status)
         root, search_opened = _ensure_wmpf_root(self.startup_timeout, self._status)
         self._start_debugger()
-        self._start_launch_patch(root)
         endpoint = _enable_xweb_use(root, self._status)
         closed = _close_visible_wmpf_windows(root.pid)
         self._status("WMPF_WINDOWS_CLOSED", f"count={closed}")
@@ -403,28 +400,6 @@ class WeChatRuntime:
         if not _wait_log(log_path, "[frida] script loaded", log_offset, self.startup_timeout):
             raise RuntimeError(f"WMPFDebugger did not finish Frida injection: {log_path}")
         self._status("DEBUGGER_ATTACHED", f"pid={process.pid}")
-
-    def _start_launch_patch(self, root: psutil.Process) -> None:
-        node = shutil.which("node")
-        if not node:
-            raise RuntimeError("node.exe is not available on PATH")
-        logs = PROJECT_DIR / "logs"
-        logs.mkdir(exist_ok=True)
-        log_path = logs / "launch-patch.log"
-        log_offset = log_path.stat().st_size if log_path.exists() else 0
-        with log_path.open("ab") as output:
-            process = subprocess.Popen(
-                [node, str(PATCH_SCRIPT), str(root.pid), self.bootstrap_app_id],
-                cwd=str(PROJECT_DIR),
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                env={**os.environ, "WMPF_DEBUGGER_DIR": str(DEBUGGER_DIR)},
-            )
-        self._owned_processes.insert(0, process)
-        if not _wait_log(log_path, '"event":"ready"', log_offset, 15.0):
-            raise RuntimeError(f"The launch patch did not become ready: {log_path}")
-        self._status("LAUNCH_PATCH_READY", f"pid={process.pid}")
 
     def _ensure_search_target(self, *, search_opened: bool = False) -> None:
         windows_before = set(_visible_wmpf_windows())
@@ -621,6 +596,7 @@ def _enable_xweb_use(
         timeout=20,
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env={**os.environ, "WMPF_PROJECT_DIR": str(PROJECT_DIR)},
     )
     endpoint = ""
     event: dict[str, Any] = {}
@@ -683,27 +659,6 @@ def _stop_stale_debugger(
             process.wait(timeout=5)
     if not _wait_until(lambda: not _listener_pids(port), 5.0):
         raise RuntimeError(f"Port {port} is still occupied")
-
-
-def _stop_stale_launch_patches(status: Callable[[str, str], None]) -> None:
-    for process in psutil.process_iter(["name", "cmdline"]):
-        try:
-            if str(process.info.get("name") or "").casefold() != "node.exe":
-                continue
-            command = " ".join(
-                str(value) for value in process.info.get("cmdline") or []
-            ).casefold()
-            if "patch_launch_config.js" not in command:
-                continue
-            status("STOPPING_STALE_LAUNCH_PATCH", f"pid={process.pid}")
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except psutil.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-        except (psutil.AccessDenied, psutil.NoSuchProcess):
-            continue
 
 
 def _find_wmpf_root() -> psutil.Process | None:

@@ -18,11 +18,40 @@ const getMainModule = (version) => {
 };
 
 const patchCDPFilter = (base, config) => {
-    if (config.Version >= 25710) {
-        send("[patch] legacy CDP filter patch skipped for WMPF >= 25710");
+    // xref: SendToClientFilter OR devtools_message_filter_applet_webview.cc
+    // xref: CastToJson
+    if (config.CastToJsonHookOffset) {
+        // credit: @Redbeanw44602, pr #262
+        const osPlatform = getPlatform();
+        if (osPlatform === "windows" || osPlatform === "darwin") {
+            // TODO: this was not tested on darwin
+            const castToJsonFunc = new NativeFunction(
+                base.add(config.CastToJsonHookOffset),
+                "pointer",
+                ["pointer", "pointer"]
+            );
+            const callback = new NativeCallback(function(thiz, jsonOut, cborInput) {
+                castToJsonFunc(jsonOut, cborInput);
+                return jsonOut;
+            }, "pointer", ["pointer", "pointer", "pointer"]);
+            Interceptor.replace(base.add(config.CDPFilterHookOffset), callback);
+        }
+        if (osPlatform === "linux") {
+            const castToJsonFunc = new NativeFunction(
+                base.add(config.CastToJsonHookOffset),
+                "pointer",
+                ["pointer", "pointer", "pointer"]
+            );
+            const callback = new NativeCallback(function (jsonOut, thiz, cborInput, cborLen) {
+                castToJsonFunc(jsonOut, cborInput, cborLen)
+                return jsonOut
+            }, "pointer", ["pointer", "pointer", "pointer", "pointer"]);
+            Interceptor.replace(base.add(config.CDPFilterHookOffset), callback);
+        }
         return;
     }
-    // xref: SendToClientFilter OR devtools_message_filter_applet_webview.cc
+
+    // legacy flue fallback
     const offset = config.CDPFilterHookOffset;
     Interceptor.attach(base.add(offset), {
         onLeave(retval_) {
@@ -45,35 +74,52 @@ const patchCDPFilter = (base, config) => {
     });
 };
 
-const hookOnLoadScene = (a1, sceneOffsets, version) => {
+const handleOnLoadStart = (a1, config) => {
+    let miniappLaunchConfigPtr;
+    let remoteDebugConfigPtr;
     let miniappScenePtr;
-    let fifth;
-    try {
-        const first = a1.add(sceneOffsets[0]).readPointer();
-        const miniappConfigPtr = first
-            .add(sceneOffsets[1])
+
+    const structOffsets = config.MiniAppConfigStructOffsets
+        ? config.MiniAppConfigStructOffsets
+        : config.SceneOffsets;
+
+    // legacy scene config
+    if (config.SceneOffsets) {
+        miniappLaunchConfigPtr = a1
+            .add(structOffsets[0])
+            .readPointer()
+            .add(structOffsets[1])
+            .readPointer()
+            .add(structOffsets[2])
             .readPointer();
-        const third = miniappConfigPtr
-            .add(sceneOffsets[2])
+        remoteDebugConfigPtr = miniappLaunchConfigPtr
+            .add(structOffsets[3])
+            .readPointer()
+            .add(structOffsets[4])
             .readPointer();
-        const fourth = third
-            .add(sceneOffsets[3])
+
+        miniappScenePtr = remoteDebugConfigPtr.add(structOffsets[5]);
+    } else {
+        // later wmpf builds (win32)
+        const launchConfigOffsets = structOffsets.LaunchConfigOffsets;
+        const remoteDebugConfigOffsets = structOffsets.RemoteDebugConfigOffsets;
+        miniappLaunchConfigPtr = a1
+            .add(launchConfigOffsets[0])
+            .readPointer()
+            .add(launchConfigOffsets[1])
+            .readPointer()
+            .add(launchConfigOffsets[2])
             .readPointer();
-        fifth = fourth
-            .add(sceneOffsets[4])
+        remoteDebugConfigPtr = miniappLaunchConfigPtr
+            .add(remoteDebugConfigOffsets[0])
+            .readPointer()
+            .add(remoteDebugConfigOffsets[1])
             .readPointer();
-        miniappScenePtr = fifth.add(sceneOffsets[5]);
-        send(
-            `[hook] scene chain: first=${first}, config=${miniappConfigPtr}, ` +
-                `third=${third}, fourth=${fourth}, fifth=${fifth}`,
-        );
-        send(`[hook] scene: ${miniappScenePtr.readInt()}`);
-    } catch (error) {
-        send(`[hook] scene chain error: ${error}`);
-        return;
+
+        miniappScenePtr = remoteDebugConfigPtr.add(structOffsets.SceneOffset);
     }
 
-    // 1000: Search runtime, not a miniapp debug session (upstream excludes it)
+    // 1000: from issue #83 <-- will crash the process
     // 1007: from issue #80
     // 1008: from issue #53
     // 1011: scan QR code
@@ -90,80 +136,62 @@ const hookOnLoadScene = (a1, sceneOffsets, version) => {
     // 1302: from services
     // 1308: minigame?
     const sceneNumberArray = [
-        1005, 1007, 1008, 1011, 1012, 1027, 1035, 1037, 1053, 1074, 1145, 1178,
+        1000, 1005, 1007, 1008, 1011, 1012, 1023, 1027, 1035, 1037, 1053, 1074, 1145, 1178,
         1256, 1260, 1302, 1308,
     ];
     if (!sceneNumberArray.includes(miniappScenePtr.readInt())) {
         return;
     }
+
+    send(`[hook] scene: ${miniappScenePtr.readInt()}`);
     send("[hook] hook scene condition -> 1101");
     miniappScenePtr.writeInt(1101);
-    try {
-        const mode = fifth.add(0x2d4).readS32();
-        const inlineLength = fifth.add(0x1b7).readS8();
-        const appIdLength = inlineLength < 0
-            ? fifth.add(0x1a8).readU64().toString()
-            : String(inlineLength);
-        send(
-            `[diagnostic] remote debug condition: mode=${mode}, ` +
-                `scene=${miniappScenePtr.readS32()}, app_id_length=${appIdLength}`,
-        );
-    } catch (error) {
-        send(`[diagnostic] remote debug condition read failed: ${error}`);
+
+    if (config.SceneOffsets) {
+        // legacy path, we are done here
+        return;
     }
 
-    // TODO: customize debugging endpoint
-    // const websocketServerStringPtr = passArgs.add(8).readPointer().add(520);
-    // VERBOSE && console.log("[hook] hook websocket server, original: ", websocketServerStringPtr.readUtf8String());
-    // websocketServerStringPtr.writeUtf8String("ws://127.0.0.1:8189/");
+    // setup the websocket back connection URL for new flue builds
+    // it's now adjustable as well :)
+    const websocketUrl = "ws://localhost:9421";
+    const websocketUrlStringPtr = miniappLaunchConfigPtr
+            .add(structOffsets.WebSocketURLStringOffset);
+    const stringMarker = websocketUrlStringPtr.add(23).readS8();
+    if (stringMarker < 0) {
+        // long representation: { data pointer, length, capacity | high bit }.
+        websocketUrlStringPtr.readPointer().writeUtf8String(websocketUrl);
+        websocketUrlStringPtr.add(8).writeU64(websocketUrl.length);
+    } else {
+        // short representation: 23 inline bytes followed by a one-byte length.
+        websocketUrlStringPtr.writeUtf8String(websocketUrl);
+        websocketUrlStringPtr.add(23).writeU8(websocketUrl.length);
+    }
+    send(`[hook] websocket url -> ${websocketUrl}`);
+
+    const remoteDebugModePtr = remoteDebugConfigPtr
+            .add(structOffsets.RemoteDebugModeOffset);
+    send(`[hook] remote debug mode: ${remoteDebugModePtr.readInt()} -> 1`);
+    remoteDebugModePtr.writeInt(1);
 };
 
 const patchOnLoadStart = (base, config) => {
     // xref: AppletIndexContainer::OnLoadStart
     Interceptor.attach(base.add(config.LoadStartHookOffset), {
         onEnter(args) {
-            const originalDebugFlag = args[1].and(0xff).toInt32();
             send(
                 `[inteceptor] AppletIndexContainer::OnLoadStart onEnter, ` +
-                    `indexContainer.this: ${args[0]}, debug_flag: ${originalDebugFlag}`,
+                `indexContainer.this: ${args[0]}`,
             );
             // write debug_flag to 0x1
             if (args[1].and(0xff).toInt32() !== 1) {
-                const patchedFlag = args[1]
-                    .and(ptr("0xffffffffffffff00"))
-                    .or(1);
-                if (getPlatform() === "windows" && Process.arch === "x64") {
-                    // Frida 17 no longer reliably writes the Windows x64 RDX
-                    // argument register through assignment to args[1]. Update
-                    // the CPU context explicitly so the following
-                    // `mov ebx, edx` observes the patched value.
-                    this.context.rdx = patchedFlag;
-                } else {
-                    args[1] = patchedFlag;
-                }
+                args[1] = args[1].and(ptr("0xffffffffffffff00")).or(1);
             }
-            const effectiveFlag =
-                getPlatform() === "windows" && Process.arch === "x64"
-                    ? this.context.rdx.and(0xff).toInt32()
-                    : args[1].and(0xff).toInt32();
-            send(`[hook] debug_flag patched: ${effectiveFlag}`);
-            // handle onLoad scene
-            hookOnLoadScene(args[0], config.SceneOffsets, config.Version);
+            // handle onLoadStart parameters
+            handleOnLoadStart(args[0], config);
         },
         onLeave(retval) {
             // do nothing
-        },
-    });
-};
-
-const patchDebugInitDiagnostic = (base, config) => {
-    if (config.Version !== 25710) return;
-    Interceptor.attach(base.add(0x369d300), {
-        onEnter(args) {
-            send(
-                `[diagnostic] remote debug initializer entered, ` +
-                    `arg0=${args[0]}, arg1=${args[1]}`,
-            );
         },
     });
 };
@@ -185,13 +213,8 @@ const parseConfig = () => {
 const main = () => {
     const config = parseConfig();
     const mainModule = getMainModule(config.Version);
-    if (mainModule === null) {
-        setTimeout(main, 10);
-        return;
-    }
     patchOnLoadStart(mainModule.base, config);
     patchCDPFilter(mainModule.base, config);
-    patchDebugInitDiagnostic(mainModule.base, config);
 };
 
 main();

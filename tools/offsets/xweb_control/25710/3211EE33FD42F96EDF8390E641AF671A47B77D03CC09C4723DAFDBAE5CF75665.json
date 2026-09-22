@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": 25710,
+  "flueSha256": "3211EE33FD42F96EDF8390E641AF671A47B77D03CC09C4723DAFDBAE5CF75665",
+  "offsets": {
+    "getManager": "0x26B2EC0",
+    "getDebugSetting": "0x26B3E90",
+    "setDebugSetting": "0x26B40B0",
+    "dispatchPoint": "0x3E679E0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "version": 25710,
+  "flueSha256": "3211EE33FD42F96EDF8390E641AF671A47B77D03CC09C4723DAFDBAE5CF75665",
+  "offsets": {
+    "valueInit": "0x3A0860",
+    "dictSet": "0x40813A0",
+    "invokeNative": "0x280F190",
+    "valueDestroy": "0x50E4530",
+    "manager": "0xDC1CCA0",
+    "dispatchPoint": "0x3E679E0",
+    "bizKey": "0xBFB052F"
+  }
+}
