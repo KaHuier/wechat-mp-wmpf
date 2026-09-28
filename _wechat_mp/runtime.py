@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -20,8 +21,7 @@ import win32process
 from websockets.sync.client import connect as sync_connect
 
 from .client import CDP_URL, SEARCH_MARKER, SEARCH_URI, WeChatMP as AsyncWeChatMP
-from .discovery import find_weixin_executable
-from .login import LoginInfo, wait_for_login
+from .login import WeixinSession, require_weixin_session
 from .models import (
     Article,
     ArticleCollection,
@@ -32,10 +32,16 @@ from .models import (
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-DEBUGGER_DIR = PROJECT_DIR / "vendor" / "WMPFDebugger"
+DEFAULT_DEBUGGER_DIR = Path(
+    os.environ.get("WMPF_DEBUGGER_DIR", "").strip()
+).expanduser() if os.environ.get("WMPF_DEBUGGER_DIR", "").strip() else None
 DETACH_SCRIPT = PROJECT_DIR / "tools" / "invoke_search_detach.js"
 OPEN_SEARCH_SCRIPT = PROJECT_DIR / "tools" / "open_search_tab.js"
-ENABLE_XWEB_SCRIPT = DEBUGGER_DIR / "tools" / "enable-xweb-use-ws.js"
+WMPF_RUNTIME_HASHES = {
+    25710: "3211EE33FD42F96EDF8390E641AF671A47B77D03CC09C4723DAFDBAE5CF75665",
+    25715: "5BAF4A84A41036CE5B2EF897D85029BDE9EE9965B4A69D4F5B594672821CAD56",
+}
+WMPF_25715_DEVTOOLS_START_OFFSET = 0x369CB70
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,19 +219,20 @@ class WeChatRuntime:
         self,
         *,
         bootstrap_app_id: str,
-        weixin_path: str | Path | None = None,
         cdp_url: str = CDP_URL,
-        login_timeout: float = 300.0,
         startup_timeout: float = 45.0,
+        wmpf_debugger_dir: str | Path | None = None,
         status_callback: StatusCallback | None = None,
     ) -> None:
         self.bootstrap_app_id = bootstrap_app_id.strip()
-        self.weixin_path = weixin_path
         self.cdp_url = cdp_url
-        self.login_timeout = login_timeout
         self.startup_timeout = startup_timeout
+        debugger_dir = Path(wmpf_debugger_dir).expanduser() if wmpf_debugger_dir else DEFAULT_DEBUGGER_DIR
+        if debugger_dir is None:
+            raise ValueError("wmpf_debugger_dir is required; clone https://github.com/evi0s/WMPFDebugger first")
+        self.debugger_dir = debugger_dir.resolve()
         self.status_callback = status_callback or _default_status
-        self.login_info: LoginInfo | None = None
+        self.weixin_session: WeixinSession | None = None
         self._owned_processes: list[subprocess.Popen[Any]] = []
         self._search_window_handles: set[int] = set()
         self._started = False
@@ -245,11 +252,7 @@ class WeChatRuntime:
             return self
         if not self.bootstrap_app_id:
             raise ValueError("bootstrap_app_id must not be empty")
-        executable = find_weixin_executable(self.weixin_path)
-        self._status("WEIXIN_FOUND", str(executable))
-        self.login_info = wait_for_login(
-            executable,
-            timeout=self.login_timeout,
+        self.weixin_session = require_weixin_session(
             status=self._status,
         )
         try:
@@ -350,22 +353,22 @@ class WeChatRuntime:
             self._status("DEBUGGER_REUSED", self.cdp_url)
             self._ensure_search_target()
             return
-        _stop_stale_debugger(self.cdp_url, DEBUGGER_DIR, self._status)
-        root, search_opened = _ensure_wmpf_root(self.startup_timeout, self._status)
-        self._start_debugger()
-        endpoint = _enable_xweb_use(root, self._status)
-        closed = _close_visible_wmpf_windows(root.pid)
-        self._status("WMPF_WINDOWS_CLOSED", f"count={closed}")
+        _stop_stale_debugger(self.cdp_url, self.debugger_dir, self._status)
+        root, _ = _ensure_wmpf_root(
+            self.startup_timeout, self._status, self.debugger_dir
+        )
+        self._start_debugger(root)
+        endpoint = _enable_xweb_use(root, self._status, self.debugger_dir)
         response = _xweb_request(
             endpoint,
             "XWeb.LaunchApplet",
-            {"app_id": self.bootstrap_app_id},
+            {"app_id": self.bootstrap_app_id, "headless": 1},
             timeout=10.0,
         )
         launched_app_id = str((response.get("result") or {}).get("app_id") or "")
         if launched_app_id != self.bootstrap_app_id:
             raise RuntimeError(f"Applet launch failed: {response}")
-        self._status("BOOTSTRAP_APPLET_STARTED", f"app_id={launched_app_id}")
+        self._status("BOOTSTRAP_APPLET_STARTED", f"app_id={launched_app_id} headless=1")
         if not _wait_until(
             lambda: _cdp_healthy(self.cdp_url, timeout=1.0),
             self.startup_timeout,
@@ -374,36 +377,53 @@ class WeChatRuntime:
                 "The bootstrap applet did not establish the CDP channel before timeout"
             )
         self._status("CDP_READY", self.cdp_url)
-        self._ensure_search_target(search_opened=search_opened)
+        # Launching the bootstrap applet can replace the WMPF container, dropping
+        # any Search page opened before it. Always open Search after bootstrap so
+        # the target exists in the live CDP session.
+        self._ensure_search_target(search_opened=False)
 
-    def _start_debugger(self) -> None:
+    def _start_debugger(self, root: psutil.Process | None = None) -> None:
         node = shutil.which("node")
         if not node:
             raise RuntimeError("node.exe is not available on PATH")
-        ts_node = DEBUGGER_DIR / "node_modules" / "ts-node" / "dist" / "bin.js"
+        ts_node = self.debugger_dir / "node_modules" / "ts-node" / "dist" / "bin.js"
         if not ts_node.is_file():
-            raise RuntimeError(f"Bundled WMPFDebugger dependencies are missing: {ts_node}")
+            raise RuntimeError(f"WMPFDebugger dependencies are missing: {ts_node}")
         logs = PROJECT_DIR / "logs"
         logs.mkdir(exist_ok=True)
         log_path = logs / "wmpf-debugger.log"
         log_offset = log_path.stat().st_size if log_path.exists() else 0
-        with log_path.open("ab") as output:
-            process = subprocess.Popen(
-                [node, str(ts_node), "src/index.ts", "--auto-detect"],
-                cwd=str(DEBUGGER_DIR),
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        self._owned_processes.append(process)
-        self._status("DEBUGGER_STARTING", f"pid={process.pid}")
-        if not _wait_log(log_path, "[frida] script loaded", log_offset, self.startup_timeout):
-            raise RuntimeError(f"WMPFDebugger did not finish Frida injection: {log_path}")
-        self._status("DEBUGGER_ATTACHED", f"pid={process.pid}")
+        live_root = root or _find_wmpf_root()
+        if live_root is None:
+            raise RuntimeError("The WMPF root process is not running")
+        hook_path = self.debugger_dir / "frida" / "hook.js"
+        original_hook, patched_hook, runtime_version = _prepare_wmpf_debugger_hook(
+            live_root,
+            hook_path,
+        )
+        hook_path.write_bytes(patched_hook)
+        self._status("DEBUGGER_PATCHED", f"runtime={runtime_version}")
+        try:
+            with log_path.open("ab") as output:
+                process = subprocess.Popen(
+                    [node, str(ts_node), "src/index.ts", "--auto-detect"],
+                    cwd=str(self.debugger_dir),
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            self._owned_processes.append(process)
+            self._status("DEBUGGER_STARTING", f"pid={process.pid}")
+            if not _wait_log(log_path, "[frida] script loaded", log_offset, self.startup_timeout):
+                raise RuntimeError(f"WMPFDebugger did not finish Frida injection: {log_path}")
+            self._status("DEBUGGER_ATTACHED", f"pid={process.pid}")
+        finally:
+            hook_path.write_bytes(original_hook)
+            self._status("DEBUGGER_PATCH_RESTORED", str(hook_path))
 
     def _ensure_search_target(self, *, search_opened: bool = False) -> None:
         windows_before = set(_visible_wmpf_windows())
-        if _cdp_has_target(self.cdp_url, SEARCH_MARKER):
+        if not search_opened and _cdp_has_target(self.cdp_url, SEARCH_MARKER):
             duplicates = _close_search_targets(self.cdp_url, keep_primary=True)
             if duplicates:
                 self._status("SEARCH_DUPLICATES_CLOSED", f"count={duplicates}")
@@ -414,14 +434,8 @@ class WeChatRuntime:
         # WMPF process. Reuse that page and detach it instead of opening a second
         # Search page here.
         if not search_opened:
-            _open_search_native()
-        root = _find_wmpf_root()
-        if root is None:
-            if not _wait_until(lambda: _find_wmpf_root() is not None, 20.0):
-                raise RuntimeError("The WMPF root process did not start")
-            root = _find_wmpf_root()
-        assert root is not None
-        time.sleep(0.8)
+            _open_search_native(self.debugger_dir)
+        root = _wait_for_live_wmpf_root(20.0)
         node = shutil.which("node")
         if not node:
             raise RuntimeError("node.exe is not available on PATH")
@@ -435,7 +449,7 @@ class WeChatRuntime:
             timeout=25,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env={**os.environ, "WMPF_DEBUGGER_DIR": str(DEBUGGER_DIR)},
+            env={**os.environ, "WMPF_DEBUGGER_DIR": str(self.debugger_dir)},
         )
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
@@ -579,16 +593,18 @@ def _xweb_request(
 def _enable_xweb_use(
     root: psutil.Process,
     status: Callable[[str, str], None],
+    debugger_dir: Path,
 ) -> str:
     node = shutil.which("node")
     if not node:
         raise RuntimeError("node.exe is not available on PATH")
-    if not ENABLE_XWEB_SCRIPT.is_file():
-        raise RuntimeError(f"XWeb helper is missing: {ENABLE_XWEB_SCRIPT}")
+    enable_xweb_script = PROJECT_DIR / "tools" / "enable-xweb-use-ws.js"
+    if not enable_xweb_script.is_file():
+        raise RuntimeError(f"XWeb helper is missing: {enable_xweb_script}")
     thread_id = _ui_thread_id(root)
     completed = subprocess.run(
-        [node, str(ENABLE_XWEB_SCRIPT), str(root.pid), str(thread_id), "15000"],
-        cwd=str(DEBUGGER_DIR),
+        [node, str(enable_xweb_script), str(root.pid), str(thread_id), "15000"],
+        cwd=str(debugger_dir),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -596,7 +612,11 @@ def _enable_xweb_use(
         timeout=20,
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        env={**os.environ, "WMPF_PROJECT_DIR": str(PROJECT_DIR)},
+        env={
+            **os.environ,
+            "WMPF_PROJECT_DIR": str(PROJECT_DIR),
+            "NODE_PATH": str(debugger_dir / "node_modules"),
+        },
     )
     endpoint = ""
     event: dict[str, Any] = {}
@@ -616,6 +636,107 @@ def _enable_xweb_use(
         f"state={event.get('state')} port={event.get('port')}",
     )
     return endpoint
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def _wmpf_runtime_identity(root: psutil.Process) -> tuple[int, str]:
+    runtime_dir: Path | None = None
+    for argument in root.cmdline():
+        if argument.startswith("--flue-runtime-dir="):
+            runtime_dir = Path(argument.split("=", 1)[1])
+            break
+    if runtime_dir is None:
+        raise RuntimeError(f"WMPF root {root.pid} has no --flue-runtime-dir argument")
+    try:
+        version = int(runtime_dir.parents[1].name)
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(f"Cannot determine WMPF runtime version from {runtime_dir}") from error
+    flue_path = runtime_dir / "flue.dll"
+    if not flue_path.is_file():
+        raise RuntimeError(f"WMPF runtime library is missing: {flue_path}")
+    return version, _sha256_file(flue_path)
+
+
+def _build_wmpf_debugger_hook(source: str, runtime_version: int) -> str:
+    scene_marker = "const sceneNumberArray = ["
+    scene_start = source.find(scene_marker)
+    scene_end = source.find("];", scene_start)
+    if scene_start < 0 or scene_end < 0:
+        raise RuntimeError("WMPFDebugger hook.js scene array was not found")
+    scene_end += 2
+    scene_block = source[scene_start:scene_end]
+    if "1000," not in scene_block:
+        scene_block = scene_block.replace("[", "[\n        1000,", 1)
+        source = source[:scene_start] + scene_block + source[scene_end:]
+
+    if runtime_version != 25715 or "[start-once] installed" in source:
+        return source
+
+    main_marker = "const main = () => {"
+    main_start = source.find(main_marker)
+    if main_start < 0:
+        raise RuntimeError("WMPFDebugger hook.js main function was not found")
+    guard = f'''const retainedStartCallbacks = [];
+const patchDevToolsStartOnce = (base, config) => {{
+    if (config.Version !== 25715) return;
+    const address = base.add(0x{WMPF_25715_DEVTOOLS_START_OFFSET:x});
+    const original = new NativeFunction(address, "void", ["pointer", "pointer"]);
+    const started = new Set();
+    const replacement = new NativeCallback((self, argument) => {{
+        const key = self.toString();
+        if (started.has(key)) {{
+            send(`[start-once] skip duplicate this=${{key}} argument=${{argument}}`);
+            return;
+        }}
+        started.add(key);
+        send(`[start-once] first this=${{key}} argument=${{argument}}`);
+        original(self, argument);
+    }}, "void", ["pointer", "pointer"]);
+    retainedStartCallbacks.push(replacement);
+    Interceptor.replace(address, replacement);
+    send(`[start-once] installed at ${{address}}`);
+}};
+
+'''
+    source = source[:main_start] + guard + source[main_start:]
+    call_marker = "    const mainModule = getMainModule(config.Version);"
+    call_start = source.find(call_marker)
+    if call_start < 0:
+        raise RuntimeError("WMPFDebugger hook.js main module initialization was not found")
+    call_end = call_start + len(call_marker)
+    newline = "\r\n" if "\r\n" in source else "\n"
+    return (
+        source[:call_end]
+        + newline
+        + "    patchDevToolsStartOnce(mainModule.base, config);"
+        + source[call_end:]
+    )
+
+
+def _prepare_wmpf_debugger_hook(
+    root: psutil.Process,
+    hook_path: Path,
+) -> tuple[bytes, bytes, int]:
+    if not hook_path.is_file():
+        raise RuntimeError(f"WMPFDebugger hook is missing: {hook_path}")
+    runtime_version, flue_hash = _wmpf_runtime_identity(root)
+    expected_hash = WMPF_RUNTIME_HASHES.get(runtime_version)
+    if expected_hash is None or flue_hash != expected_hash:
+        raise RuntimeError(
+            "Unsupported WMPF runtime for the debugger patch: "
+            f"version={runtime_version} flue_sha256={flue_hash}"
+        )
+    original = hook_path.read_bytes()
+    source = original.decode("utf-8")
+    patched = _build_wmpf_debugger_hook(source, runtime_version).encode("utf-8")
+    return original, patched, runtime_version
 
 
 def _listener_pids(port: int) -> set[int]:
@@ -678,17 +799,32 @@ def _find_wmpf_root() -> psutil.Process | None:
 
 def _find_weixin_root() -> psutil.Process | None:
     roots: list[psutil.Process] = []
-    for process in psutil.process_iter(["name", "cmdline", "create_time"]):
+    dll_roots: list[psutil.Process] = []
+    for process in psutil.process_iter(["name", "cmdline", "create_time", "ppid"]):
         try:
             if str(process.info.get("name") or "").casefold() != "weixin.exe":
                 continue
             command = [str(value) for value in process.info.get("cmdline") or []]
+            # The primary client is the Weixin.exe launched by Explorer. All
+            # --type=... instances are Chromium/plugin children.
             if any(value.startswith("--type=") for value in command[1:]):
                 continue
+            try:
+                parent = process.parent()
+                if parent is not None and parent.name().casefold() == "weixin.exe":
+                    continue
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
             roots.append(process)
+            try:
+                if any(Path(m.path).name.casefold() == "wmpf_host_export_x64.dll" for m in process.memory_maps()):
+                    dll_roots.append(process)
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             continue
-    return max(roots, key=lambda process: process.create_time(), default=None)
+    candidates = dll_roots or roots
+    return max(candidates, key=lambda process: process.create_time(), default=None)
 
 
 def _largest_process_window(process_id: int) -> tuple[int, int] | None:
@@ -712,7 +848,7 @@ def _largest_process_window(process_id: int) -> tuple[int, int] | None:
     return hwnd, thread_id
 
 
-def _open_search_native() -> None:
+def _open_search_native(debugger_dir: Path | None = None) -> None:
     root = _find_weixin_root()
     if root is None:
         raise RuntimeError("The unified Weixin root process is not running")
@@ -733,32 +869,14 @@ def _open_search_native() -> None:
         timeout=20,
         check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        env={**os.environ, "WMPF_DEBUGGER_DIR": str(DEBUGGER_DIR)},
+        env={
+            **os.environ,
+            **({"WMPF_DEBUGGER_DIR": str(debugger_dir)} if debugger_dir else {}),
+        },
     )
     if completed.returncode != 0 or '"event":"completed"' not in completed.stdout:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise RuntimeError(f"Native Search AddTab failed: {detail}")
-
-
-def _close_visible_wmpf_windows(process_id: int, *, timeout: float = 5.0) -> int:
-    windows: list[int] = []
-
-    def callback(hwnd: int, _: object) -> None:
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        _, owner_pid = win32process.GetWindowThreadProcessId(hwnd)
-        if owner_pid == process_id and win32gui.GetClassName(hwnd) == "Chrome_WidgetWin_0":
-            windows.append(hwnd)
-
-    win32gui.EnumWindows(callback, None)
-    for hwnd in windows:
-        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not any(win32gui.IsWindow(hwnd) for hwnd in windows):
-            break
-        time.sleep(0.1)
-    return len(windows)
 
 
 def _visible_wmpf_windows() -> list[int]:
@@ -794,20 +912,39 @@ def _close_window_handles(handles: set[int], *, timeout: float = 5.0) -> int:
 def _ensure_wmpf_root(
     timeout: float,
     status: Callable[[str, str], None],
+    debugger_dir: Path | None = None,
 ) -> tuple[psutil.Process, bool]:
-    root = _find_wmpf_root()
-    if root is not None:
-        status("WMPF_ROOT_READY", f"pid={root.pid}")
-        return root, False
+    existing = _find_wmpf_root()
+    if existing is not None and _visible_wmpf_windows():
+        status("WMPF_ROOT_READY", f"pid={existing.pid}")
+        return existing, False
     status("WMPF_ROOT_STARTING", SEARCH_URI)
-    _open_search_native()
-    if not _wait_until(lambda: _find_wmpf_root() is not None, timeout):
+    _open_search_native(debugger_dir)
+
+    def search_root_ready() -> bool:
+        root = _find_wmpf_root()
+        return root is not None and bool(_visible_wmpf_windows())
+
+    if not _wait_until(search_root_ready, timeout):
         raise RuntimeError("The WMPF root process did not start")
     root = _find_wmpf_root()
     assert root is not None
     status("WMPF_ROOT_READY", f"pid={root.pid}")
     return root, True
 
+
+def _wait_for_live_wmpf_root(timeout: float) -> psutil.Process:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        root = _find_wmpf_root()
+        if root is not None:
+            try:
+                if not hasattr(root, "threads") or root.threads():
+                    return root
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+        time.sleep(0.25)
+    raise RuntimeError("The WMPF root process did not start")
 
 def _ui_thread_id(process: psutil.Process) -> int:
     class FileTime(ctypes.Structure):
@@ -856,17 +993,15 @@ def _wait_log(path: Path, marker: str, offset: int, timeout: float) -> bool:
 def start_runtime(
     *,
     bootstrap_app_id: str,
-    weixin_path: str | Path | None = None,
     cdp_url: str = CDP_URL,
-    login_timeout: float = 300.0,
     startup_timeout: float = 45.0,
+    wmpf_debugger_dir: str | Path | None = None,
     status_callback: StatusCallback | None = None,
 ) -> WeChatRuntime:
     return WeChatRuntime(
         bootstrap_app_id=bootstrap_app_id,
-        weixin_path=weixin_path,
         cdp_url=cdp_url,
-        login_timeout=login_timeout,
         startup_timeout=startup_timeout,
+        wmpf_debugger_dir=wmpf_debugger_dir,
         status_callback=status_callback,
     )

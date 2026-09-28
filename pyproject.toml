@@ -1,7 +1,7 @@
 [project]
 name = "wechat-wmpf-crawler"
 version = "0.1.0"
-description = "Local WMPF CDP account collector with a bundled debugger runtime"
+description = "Windows WeChat official-account collector over WMPF and CDP"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

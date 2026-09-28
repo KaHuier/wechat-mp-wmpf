@@ -1,13 +1,13 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import wechat_mp
+from _wechat_mp.login import require_weixin_session
 from _wechat_mp.models import OfficialAccountInfo, ProfileTarget
 from _wechat_mp.runtime import OfficialAccount, WeChatRuntime
 from _wechat_mp import runtime as runtime_module
@@ -74,13 +74,15 @@ class PublicApiTests(unittest.TestCase):
         FakeAsyncClient.next_calls = 0
 
     def runtime(self) -> WeChatRuntime:
-        value = WeChatRuntime(bootstrap_app_id="wx0000000000000000")
+        value = WeChatRuntime(
+            bootstrap_app_id="wx0000000000000000",
+            wmpf_debugger_dir="WMPFDebugger",
+        )
         value._started = True
         return value
 
     def test_module_exports_new_api(self) -> None:
         self.assertTrue(callable(wechat_mp.start_runtime))
-        self.assertTrue(callable(wechat_mp.find_weixin_executable))
         self.assertIs(wechat_mp.WeChatRuntime, WeChatRuntime)
         self.assertIs(wechat_mp.OfficialAccount, OfficialAccount)
         self.assertTrue(hasattr(wechat_mp, "ArticlePage"))
@@ -199,55 +201,86 @@ class PublicApiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             account.article_pages(max_pages=0)
 
-    def test_explicit_executable_path(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            executable = Path(directory) / "Weixin.exe"
-            executable.touch()
-            self.assertEqual(
-                wechat_mp.find_weixin_executable(executable),
-                executable.resolve(),
+    @patch("_wechat_mp.login.weixin_processes", return_value=[])
+    def test_runtime_requires_weixin_to_be_running(self, _processes) -> None:
+        events: list[tuple[str, str]] = []
+        with self.assertRaisesRegex(RuntimeError, "Weixin is not signed in or the login state is not ready"):
+            require_weixin_session(
+                status=lambda state, message: events.append((state, message)),
             )
+        self.assertEqual(events, [])
 
+    @patch("_wechat_mp.runtime._visible_wmpf_windows", side_effect=[[], [100]])
     @patch("_wechat_mp.runtime._open_search_native")
     @patch("_wechat_mp.runtime._find_wmpf_root")
-    def test_cold_start_marks_search_as_already_opened(
+    def test_runtime_bootstraps_a_search_wmpf_root(
         self,
         find_root,
         open_search,
+        _visible_windows,
     ) -> None:
         root = SimpleNamespace(pid=123)
-        find_root.side_effect = [None, root, root]
+        find_root.side_effect = [None, root, root, root]
         found, search_opened = runtime_module._ensure_wmpf_root(1.0, lambda *_: None)
         self.assertIs(found, root)
         self.assertTrue(search_opened)
-        open_search.assert_called_once_with()
+        open_search.assert_called_once_with(None)
 
+    @patch("_wechat_mp.runtime._ui_thread_id", return_value=456)
+    @patch("_wechat_mp.runtime._find_wmpf_root", return_value=SimpleNamespace(pid=123))
     @patch("_wechat_mp.runtime._open_search_native")
     @patch("_wechat_mp.runtime._visible_wmpf_windows", side_effect=[[], [100]])
     @patch("_wechat_mp.runtime._close_search_targets", return_value=1)
-    @patch("_wechat_mp.runtime._ui_thread_id", return_value=456)
-    @patch("_wechat_mp.runtime._find_wmpf_root")
     @patch("_wechat_mp.runtime._cdp_has_target", side_effect=[False, True])
     @patch("_wechat_mp.runtime.subprocess.run")
     @patch("_wechat_mp.runtime.shutil.which", return_value="node")
-    def test_detach_reuses_search_opened_during_cold_start(
+    def test_search_opens_when_no_bootstrap_search(
         self,
         _which,
         run,
         _has_target,
-        find_root,
-        _thread_id,
         close_search_targets,
         _visible_windows,
         open_search,
+        _find_root,
+        _thread_id,
     ) -> None:
         run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
-        find_root.return_value = SimpleNamespace(pid=123)
-        runtime = WeChatRuntime(bootstrap_app_id="wx0000000000000000")
-        runtime._ensure_search_target(search_opened=True)
-        open_search.assert_not_called()
+        runtime = WeChatRuntime(
+            bootstrap_app_id="wx0000000000000000",
+            wmpf_debugger_dir="WMPFDebugger",
+        )
+        runtime._ensure_search_target()
+        open_search.assert_called_once_with(runtime.debugger_dir)
         close_search_targets.assert_called_once_with(runtime.cdp_url, keep_primary=True)
         self.assertEqual(runtime._search_window_handles, {100})
+
+    @patch("_wechat_mp.runtime._ui_thread_id", return_value=456)
+    @patch("_wechat_mp.runtime._find_wmpf_root", return_value=SimpleNamespace(pid=123))
+    @patch("_wechat_mp.runtime._visible_wmpf_windows", return_value=[])
+    @patch("_wechat_mp.runtime._close_search_targets", return_value=0)
+    @patch("_wechat_mp.runtime._cdp_has_target", side_effect=[False, True])
+    @patch("_wechat_mp.runtime.subprocess.run")
+    @patch("_wechat_mp.runtime.shutil.which", return_value="node")
+    @patch("_wechat_mp.runtime._open_search_native")
+    def test_search_reuses_bootstrap_window_without_second_add_tab(
+        self,
+        open_search,
+        _which,
+        run,
+        _has_target,
+        _close_targets,
+        _visible_windows,
+        _find_root,
+        _thread_id,
+    ) -> None:
+        run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+        runtime = WeChatRuntime(
+            bootstrap_app_id="wx0000000000000000",
+            wmpf_debugger_dir="WMPFDebugger",
+        )
+        runtime._ensure_search_target(search_opened=True)
+        open_search.assert_not_called()
 
     @patch("_wechat_mp.runtime._cdp_close_target", return_value=True)
     @patch("_wechat_mp.runtime._cdp_request")
@@ -289,6 +322,7 @@ class PublicApiTests(unittest.TestCase):
         events = []
         runtime = WeChatRuntime(
             bootstrap_app_id="wx0000000000000000",
+            wmpf_debugger_dir="WMPFDebugger",
             status_callback=events.append,
         )
         runtime._started = True
@@ -306,6 +340,29 @@ class PublicApiTests(unittest.TestCase):
         with patch("sys.argv", ["run.py", "--account", "ACCOUNT_NAME"]):
             args = cli.parse_args()
         self.assertFalse(hasattr(args, "output"))
+
+    def test_cli_collect_uses_current_runtime_signature(self) -> None:
+        import run as cli
+
+        args = SimpleNamespace(
+            account="ACCOUNT_NAME",
+            account_user_name="",
+            delay=0.0,
+            bootstrap_app_id="wx0000000000000000",
+            startup_timeout=1.0,
+        )
+        with patch("run.wechat_mp.start_runtime") as start_runtime:
+            client = MagicMock()
+            start_runtime.return_value.__enter__.return_value = client
+            account = MagicMock()
+            account.collect_all_articles.return_value = "result"
+            client.search_one.return_value = account
+            self.assertEqual(cli.collect(args), "result")
+        _, kwargs = start_runtime.call_args
+        self.assertNotIn("weixin_path", kwargs)
+        self.assertNotIn("login_timeout", kwargs)
+        self.assertEqual(kwargs["bootstrap_app_id"], "wx0000000000000000")
+        self.assertEqual(kwargs["startup_timeout"], 1.0)
 
 
 if __name__ == "__main__":

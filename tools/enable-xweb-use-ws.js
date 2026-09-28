@@ -1,4 +1,4 @@
-"use strict";
+﻿"use strict";
 
 const path = require("node:path");
 const frida = require("frida");
