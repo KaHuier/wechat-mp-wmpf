@@ -4,6 +4,14 @@ Windows 本地微信公众号采集工具。项目通过微信 WMPF/XWeb、Frida
 
 关键词：`wechat`、`wechat-mp`、`wechat-mp-wmpf`、`wechat-collector`、`微信公众号采集`、`WMPF`、`WMPFDebugger`、`CDP`。
 
+> 📌 **注意事项**
+>
+> 本项目为科研辅助工具，面向学术研究、课程项目和个人学习场景。
+>
+> 使用者应遵守微信平台服务协议、《网络安全法》及相关法律法规，合理处理公开文章材料、引用方式和研究结果。
+>
+> 使用过程中涉及的法律、平台规则和研究伦理责任由使用者自行承担。
+
 ## 环境要求
 
 - Windows 10/11
@@ -80,7 +88,7 @@ with wechat_mp.start_runtime(
 
 1. 检查微信进程和当前登录账号。
 2. 选择现有 WMPF 根进程。
-3. 校验 WMPF runtime 版本和 `flue.dll` SHA256。
+3. 校验 WMPF runtime 版本。
 4. 启动调试桥，并通过 `XWeb.LaunchApplet(headless=1)` 建立不可见的 Remote Debug 会话。
 5. 使用原生 AddTab 打开搜一搜并将其绑定到 CDP。
 6. 通过 Search/Profile Target 执行搜索和文章分页。
@@ -90,12 +98,12 @@ with wechat_mp.start_runtime(
 
 当前支持：
 
-| WMPF runtime | flue.dll SHA256 |
-| --- | --- |
-| 25710 | `3211EE33FD42F96EDF8390E641AF671A47B77D03CC09C4723DAFDBAE5CF75665` |
-| 25715 | `5BAF4A84A41036CE5B2EF897D85029BDE9EE9965B4A69D4F5B594672821CAD56` |
+| WMPF runtime |
+| --- |
+| 25710 |
+| 25715 |
 
-Search detach 和 XWeb 控制偏移按照 runtime 版本与 `flue.dll` SHA256 精确加载，配置位于 [`tools/offsets`](tools/offsets)。版本或文件哈希不匹配时，运行时会停止启动，避免使用错误偏移。
+Search detach 和 XWeb 控制偏移按照 WMPF runtime 版本加载，配置位于 [`tools/offsets`](tools/offsets)。不支持的 runtime 版本会停止启动，避免使用错误偏移。
 
 ## 命令行
 
